@@ -1,0 +1,24 @@
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local configuration
+.env
+.env.*
+!.env.example
+
+# Generated models, training histories, and outputs
+*.pth
+*.pkl
+*.log
+outputs/
+plots/
+
+# IDE and operating system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

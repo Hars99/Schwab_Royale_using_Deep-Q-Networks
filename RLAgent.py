@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import random
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -43,20 +42,29 @@ class PrioritizedReplayBuffer:
         total = len(self.buffer)
         weights = (total * probs[indices]) ** (-beta)
         weights /= weights.max()
-        return samples, torch.FloatTensor(weights), indices
+        return samples, weights.astype(np.float32), indices
 
     def update_priorities(self, indices, errors):
         for idx, error in zip(indices, errors):
             self.priorities[idx] = (abs(error) + 1e-5) ** self.alpha
 
 class RLAgent(nn.Module):
-    def __init__(self, env, team_id, hidden_dim=128, lr=1e-3):
+    def __init__(self, env, team_id, hidden_dim=128, lr=1e-3, device=None):
         super(RLAgent, self).__init__()
         self.team_id = team_id
         self.observation_dim = np.prod(env.grid_size)
         self.action_dim = env.action_space.n
-        self.q_network = QNetwork(self.observation_dim, self.action_dim, hidden_dim)
-        self.target_network = QNetwork(self.observation_dim, self.action_dim, hidden_dim)
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        self._device = torch.device(device)
+        if self._device.type == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError("CUDA was requested, but is not available.")
+        self.q_network = QNetwork(
+            self.observation_dim, self.action_dim, hidden_dim
+        ).to(self._device)
+        self.target_network = QNetwork(
+            self.observation_dim, self.action_dim, hidden_dim
+        ).to(self._device)
         self.optimizer = torch.optim.Adam(self.q_network.parameters(), lr=lr)
         self.memory = PrioritizedReplayBuffer(capacity=10000)
         self.gamma = 0.95
@@ -70,13 +78,24 @@ class RLAgent(nn.Module):
 
         self.rewards_per_episode = []
 
+    @property
+    def device(self):
+        return next(self.q_network.parameters()).device
+
     def update_target(self):
         self.target_network.load_state_dict(self.q_network.state_dict())
+
+    def _state_tensor(self, obs):
+        return torch.as_tensor(
+            np.asarray(obs).reshape(-1),
+            dtype=torch.float32,
+            device=self.device,
+        ).unsqueeze(0)
 
     def act(self, obs):
         if np.random.rand() < self.epsilon:
             return np.random.randint(self.action_dim)
-        obs_tensor = torch.FloatTensor(obs.flatten()).unsqueeze(0)
+        obs_tensor = self._state_tensor(obs)
         with torch.no_grad():
             q_values = self.q_network(obs_tensor)
         return int(torch.argmax(q_values).item())
@@ -85,13 +104,19 @@ class RLAgent(nn.Module):
         self.memory.push(transition, error)
 
     def compute_td_error(self, obs, action, reward, next_obs, done):
-        obs_tensor = torch.FloatTensor(obs.flatten()).unsqueeze(0)
-        next_obs_tensor = torch.FloatTensor(next_obs.flatten()).unsqueeze(0)
+        obs_tensor = self._state_tensor(obs)
+        next_obs_tensor = self._state_tensor(next_obs)
         with torch.no_grad():
             q_val = self.q_network(obs_tensor)[0, action]
             next_action = self.q_network(next_obs_tensor).argmax().item()
             next_q_val = self.target_network(next_obs_tensor)[0, next_action]
-            target = reward + self.gamma * next_q_val * (1 - done)
+            reward_tensor = torch.as_tensor(
+                reward, dtype=torch.float32, device=self.device
+            )
+            done_tensor = torch.as_tensor(
+                done, dtype=torch.float32, device=self.device
+            )
+            target = reward_tensor + self.gamma * next_q_val * (1 - done_tensor)
         return (q_val - target).item()
 
     def learn(self):
@@ -99,11 +124,26 @@ class RLAgent(nn.Module):
             return
         batch, weights, indices = self.memory.sample(self.batch_size, self.beta)
         obs, action, reward, next_obs, done = zip(*batch)
-        obs = torch.FloatTensor(np.array([o.flatten() for o in obs]))
-        next_obs = torch.FloatTensor(np.array([no.flatten() for no in next_obs]))
-        action = torch.LongTensor(action)
-        reward = torch.FloatTensor(reward)
-        done = torch.FloatTensor(done)
+        obs = torch.as_tensor(
+            np.stack([np.asarray(state).reshape(-1) for state in obs]),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        next_obs = torch.as_tensor(
+            np.stack([np.asarray(state).reshape(-1) for state in next_obs]),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        action = torch.as_tensor(
+            action, dtype=torch.long, device=self.device
+        )
+        reward = torch.as_tensor(
+            reward, dtype=torch.float32, device=self.device
+        )
+        done = torch.as_tensor(done, dtype=torch.float32, device=self.device)
+        weights = torch.as_tensor(
+            weights, dtype=torch.float32, device=self.device
+        )
 
         q_vals = self.q_network(obs).gather(1, action.unsqueeze(1)).squeeze()
         next_actions = self.q_network(next_obs).argmax(1)
@@ -113,7 +153,6 @@ class RLAgent(nn.Module):
         errors = (q_vals - target.detach()).abs().detach().cpu().numpy()
         self.memory.update_priorities(indices, errors)
 
-        weights = weights.to(q_vals.device)
         loss = (F.mse_loss(q_vals, target.detach(), reduction='none') * weights).mean()
 
         self.optimizer.zero_grad()
@@ -140,5 +179,7 @@ class RLAgent(nn.Module):
         torch.save(self.q_network.state_dict(), path)
 
     def load_model(self, path):
-        self.q_network.load_state_dict(torch.load(path))
+        self.q_network.load_state_dict(
+            torch.load(path, map_location=self.device)
+        )
         self.target_network.load_state_dict(self.q_network.state_dict())

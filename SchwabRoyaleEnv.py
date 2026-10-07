@@ -1,6 +1,6 @@
-import gym
+import gymnasium as gym
 import numpy as np
-from gym import spaces
+from gymnasium import spaces
 
 class SchwabRoyaleEnv(gym.Env):
     def __init__(self, grid_size=(10, 10), num_teams=2, num_obstacles=10, max_turns=100):
@@ -13,7 +13,12 @@ class SchwabRoyaleEnv(gym.Env):
         self.turn_count = 0
         self.agent_roles = ["H", "N", "S"]
         self.team_health = {i: 60 for i in range(self.num_teams)}
-        self.observation_space = spaces.Box(low=0, high=1, shape=(grid_size[0], grid_size[1]), dtype=np.float32)
+        self.observation_space = spaces.Box(
+            low=-1.0,
+            high=1.0,
+            shape=(grid_size[0], grid_size[1]),
+            dtype=np.float32,
+        )
         self.action_space = spaces.Discrete(6)
         self.reset()
 
@@ -34,6 +39,7 @@ class SchwabRoyaleEnv(gym.Env):
                 agent_name = f"{team_id}-{role}"
                 self.agents[agent_name] = {'position': [x, y], 'health': 20, 'team': team_id, 'role': role}
                 self.teams[team_id].append(agent_name)
+        self._update_team_health()
         return self._get_observation()
 
     def step(self, actions):
@@ -63,12 +69,25 @@ class SchwabRoyaleEnv(gym.Env):
                 rewards[agent] += self._heal(agent)
 
         # Team health check
-        for team_id in self.teams:
-            self.team_health[team_id] = sum(self.agents[agent]['health'] for agent in self.teams[team_id])
-        alive_teams = [team for team in self.team_health if self.team_health[team] > 0]
-        done = len(alive_teams) == 1 or self.turn_count >= self.max_turns
+        self._update_team_health()
+        alive_teams = [team for team, health in self.team_health.items() if health > 0]
+        done = len(alive_teams) <= 1 or self.turn_count >= self.max_turns
 
         return self._get_observation(), rewards, done, {}
+
+    def _update_team_health(self):
+        for team_id, team_agents in self.teams.items():
+            self.team_health[team_id] = sum(
+                self.agents[agent]["health"] for agent in team_agents
+            )
+
+    def get_winner(self):
+        alive_teams = [
+            team_id
+            for team_id, team_agents in self.teams.items()
+            if any(self.agents[agent]["health"] > 0 for agent in team_agents)
+        ]
+        return alive_teams[0] if len(alive_teams) == 1 else None
 
     def _attack(self, agent):
         x, y = self.agents[agent]['position']
@@ -76,24 +95,35 @@ class SchwabRoyaleEnv(gym.Env):
         attacker_team = self.agents[agent]['team']
         damage = 4 if attacker_role == "S" else 8 if attacker_role == "N" else 0
         reward = 0
-        for target, info in self.agents.items():
+        for info in self.agents.values():
             if info['team'] != attacker_team and abs(info['position'][0] - x) + abs(info['position'][1] - y) <= 1:
                 if info['health'] > 0:
                     info['health'] = max(0, info['health'] - damage)
-                    reward += 10
+                    if damage > 0:
+                        reward += 10
         return reward
 
     def _heal(self, agent):
         if self.agents[agent]['role'] == "H":
             x, y = self.agents[agent]['position']
-            for target, info in self.agents.items():
-                if info['team'] == self.agents[agent]['team'] and info['position'] == [x, y]:
-                    info['health'] = min(20, info['health'] + 4)
-                    return 5
+            injured_allies = [
+                (target, info)
+                for target, info in self.agents.items()
+                if info["team"] == self.agents[agent]["team"]
+                and info["position"] == [x, y]
+                and 0 < info["health"] < 20
+            ]
+            if injured_allies:
+                _, info = min(
+                    injured_allies,
+                    key=lambda ally: (ally[0] == agent, ally[1]["health"]),
+                )
+                info["health"] = min(20, info["health"] + 4)
+                return 5
         return 0
 
     def _get_observation(self):
-        grid = np.zeros(self.grid_size)
+        grid = np.zeros(self.grid_size, dtype=np.float32)
         for x, y in self.obstacles:
             grid[x, y] = -1
         for agent in self.agents.values():
@@ -132,4 +162,3 @@ if __name__ == "__main__":
     print("\nSample Rewards after one step:")
     for agent, reward in rewards.items():
         print(f"{agent}: {reward}")
-

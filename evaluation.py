@@ -1,62 +1,140 @@
-import pickle
-import matplotlib.pyplot as plt
+import argparse
+from pathlib import Path
+
+import numpy as np
+import torch
+
 from RLAgent import RLAgent
 from SchwabRoyaleEnv import SchwabRoyaleEnv
-import torch
-import os
 
-# Setup
-num_teams = 2
-agents_per_team = {}
-env = SchwabRoyaleEnv(grid_size=(10, 10), num_teams=num_teams, num_obstacles=10, max_turns=100)
 
-# Load agents and their reward history
-for team_id in range(num_teams):
-    agent = RLAgent(env, team_id=team_id)
+def evaluate(episodes=100, model_dir="outputs", max_turns=100, device=None, seed=None):
+    if episodes < 1:
+        raise ValueError("episodes must be greater than zero.")
+    if max_turns < 1:
+        raise ValueError("max_turns must be greater than zero.")
+    if seed is not None:
+        np.random.seed(seed)
+        torch.manual_seed(seed)
 
-    # Load model (optional if you're comparing performance)
-    model_path = f"team{team_id}_model.pth"
-    if os.path.exists(model_path):
-        agent.load_model(model_path)
-        print(f"Loaded model for Team {team_id}")
+    env = SchwabRoyaleEnv(
+        grid_size=(10, 10),
+        num_teams=2,
+        num_obstacles=10,
+        max_turns=max_turns,
+    )
+    agents = {
+        team_id: RLAgent(env, team_id=team_id, device=device)
+        for team_id in range(env.num_teams)
+    }
+    model_root = Path(model_dir)
+    model_paths = {
+        team_id: model_root / f"team{team_id}_model.pth"
+        for team_id in agents
+    }
+    missing_models = [path for path in model_paths.values() if not path.is_file()]
+    if missing_models:
+        missing_list = ", ".join(str(path) for path in missing_models)
+        raise FileNotFoundError(
+            f"Missing trained model(s): {missing_list}. "
+            "Run training.py first or provide the correct --model-dir."
+        )
 
-    # Load reward history
-    reward_path = f"team{team_id}_rewards.pkl"
-    if os.path.exists(reward_path):
-        with open(reward_path, "rb") as f:
-            agent.rewards_per_episode = pickle.load(f)
-        print(f"Loaded rewards for Team {team_id} ({len(agent.rewards_per_episode)} episodes)")
-    else:
-        print(f"Warning: No reward file found for Team {team_id}")
-        agent.rewards_per_episode = []
+    for team_id, agent in agents.items():
+        agent.load_model(model_paths[team_id])
+        agent.epsilon = 0.0
 
-    agents_per_team[team_id] = agent
+    wins = {team_id: 0 for team_id in agents}
+    draws = 0
+    reward_totals = {team_id: 0.0 for team_id in agents}
+    episode_lengths = []
 
-# Compute and display results
-avg_rewards = {}
-for team_id, agent in agents_per_team.items():
-    if agent.rewards_per_episode:
-        avg = sum(agent.rewards_per_episode) / len(agent.rewards_per_episode)
-    else:
-        avg = 0
-    avg_rewards[team_id] = avg
+    for episode in range(episodes):
+        obs = env.reset()
+        episode_rewards = {team_id: 0.0 for team_id in agents}
+        done = False
+        turns = 0
 
-# Declare winner
-winning_team = max(avg_rewards, key=avg_rewards.get)
-print("\n🏆 Evaluation Results 🏆")
-for team_id, avg in avg_rewards.items():
-    print(f"Team {team_id} - Avg Reward: {avg:.2f}")
-print(f"\n🏅 Winning Team: Team {winning_team}")
+        while not done:
+            actions = {}
+            for team_id, agent in agents.items():
+                actions.update(
+                    {
+                        agent_name: agent.act(obs)
+                        for agent_name in env.teams[team_id]
+                    }
+                )
+            obs, rewards, done, _ = env.step(actions)
+            turns += 1
+            for team_id, team_agents in env.teams.items():
+                episode_rewards[team_id] += sum(
+                    rewards[agent_name] for agent_name in team_agents
+                )
 
-# Plot reward trends
-plt.figure(figsize=(10, 6))
-for team_id, agent in agents_per_team.items():
-    if agent.rewards_per_episode:
-        plt.plot(agent.rewards_per_episode, label=f"Team {team_id}")
-plt.xlabel("Episode")
-plt.ylabel("Reward")
-plt.title("Training Reward Curve")
-plt.legend()
-plt.grid(True)
-plt.tight_layout()
-plt.show()
+        winner = env.get_winner()
+        if winner is None:
+            draws += 1
+            outcome = "Draw"
+        else:
+            wins[winner] += 1
+            outcome = f"Team {winner + 1} wins"
+        for team_id in agents:
+            reward_totals[team_id] += episode_rewards[team_id]
+        episode_lengths.append(turns)
+        print(
+            f"Evaluation episode {episode + 1}/{episodes} | "
+            f"Turns: {turns} | Outcome: {outcome}"
+        )
+
+    print(f"\nEvaluation summary over {episodes} episodes:")
+    for team_id in agents:
+        print(
+            f"Team {team_id + 1}: wins={wins[team_id]}, "
+            f"average episode reward={reward_totals[team_id] / episodes:.2f}"
+        )
+    print(f"Draws: {draws}")
+    print(f"Average episode length: {sum(episode_lengths) / episodes:.2f} turns")
+    return {
+        "wins": wins,
+        "draws": draws,
+        "average_rewards": {
+            team_id: reward_totals[team_id] / episodes for team_id in agents
+        },
+        "average_episode_length": sum(episode_lengths) / episodes,
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Evaluate trained team policies by playing complete games."
+    )
+    parser.add_argument("--episodes", type=int, default=100)
+    parser.add_argument("--max-turns", type=int, default=100)
+    parser.add_argument("--model-dir", default="outputs")
+    parser.add_argument(
+        "--device",
+        choices=("auto", "cpu", "cuda"),
+        default="auto",
+        help="Compute device; auto selects CUDA when available, otherwise CPU.",
+    )
+    parser.add_argument("--seed", type=int)
+    args = parser.parse_args()
+    if args.episodes < 1:
+        parser.error("--episodes must be greater than zero.")
+    if args.max_turns < 1:
+        parser.error("--max-turns must be greater than zero.")
+
+    try:
+        evaluate(
+            episodes=args.episodes,
+            model_dir=args.model_dir,
+            max_turns=args.max_turns,
+            device=None if args.device == "auto" else args.device,
+            seed=args.seed,
+        )
+    except FileNotFoundError as error:
+        parser.error(str(error))
+
+
+if __name__ == "__main__":
+    main()
