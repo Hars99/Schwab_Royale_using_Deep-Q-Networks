@@ -20,6 +20,10 @@ Each team uses one shared Deep Q-Network (DQN) policy to choose actions for its 
 
 The scripts configure a 10 × 10 grid with 10 randomly placed obstacles, two teams, three agents per team, and a 100-turn limit. Each agent starts with 20 health. The grid observation is a shared `float32` array: empty cells are `0`, obstacles are `-1`, and cells occupied by agents are `1`. It does not encode agent identity, team, role, or health.
 
+Example visualization of the game environment:
+
+![Example Schwab Royale game environment](https://github.com/user-attachments/assets/d0052888-43a4-4d4c-8b05-073b0c9b4a69)
+
 Each team has:
 
 - **Healer (H):** action 5 heals an injured, living teammate on the same cell by up to 4 health. If there is no injured teammate on that cell, an injured healer may heal itself. Healing a full-health unit or having no valid target gives no heal reward.
